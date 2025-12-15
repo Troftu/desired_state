@@ -48,11 +48,11 @@ pub fn read(path: &Path) -> AppResult<(Version, BTreeMap<String, Service>)> {
         return Ok((current_file_version(), BTreeMap::new()));
     }
 
-    let raw = match fs::read_to_string(path) {
+    let yaml_string = match fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(err) => {
             warn!(
-                "Failed to read desired state file '{}': '{}'. Recreating template.",
+                "Failed to read desired state file '{}': '{}'. Returning empty state and recreating template.",
                 path.display(),
                 err
             );
@@ -61,19 +61,20 @@ pub fn read(path: &Path) -> AppResult<(Version, BTreeMap<String, Service>)> {
         }
     };
 
-    if raw.trim().is_empty() {
+    if yaml_string.trim().is_empty() {
         debug!(
-            "Desired state file '{}' is empty; returning empty state",
+            "Desired state file '{}' is empty. Returning empty state and recreating template.",
             path.display()
         );
+        create_template_file(path)?;
         return Ok((current_file_version(), BTreeMap::new()));
     }
 
-    let parsed: DesiredStateFile = match serde_yaml::from_str(&raw) {
+    let parsed: DesiredStateFile = match serde_yaml::from_str(&yaml_string) {
         Ok(parsed) => parsed,
         Err(err) => {
             warn!(
-                "Failed to parse desired state file '{}'; treating as empty: {}",
+                "Failed to parse desired state file '{}'. Treating as empty. Err: {}",
                 path.display(),
                 err
             );
@@ -144,26 +145,29 @@ pub fn current_file_version() -> Version {
 }
 
 fn create_template_file(path: &Path) -> AppResult<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
 
-    let template_doc = DesiredStateFile {
+    let template_yml = DesiredStateFile {
         version: current_file_version(),
         services: vec![
             DesiredStateFileService {
                 name: "example-service".to_string(),
-                version: VersionReq::parse("^1.2.3").expect("static version requirement must be valid"),
+                version: VersionReq::parse("^1.2.3")
+                    .expect("static version requirement must be valid"),
             },
             DesiredStateFileService {
                 name: "second-example-service".to_string(),
-                version: VersionReq::parse(">0.1.0").expect("static version requirement must be valid"),
+                version: VersionReq::parse(">0.1.0")
+                    .expect("static version requirement must be valid"),
             },
         ],
     };
 
-    let yaml = serde_yaml::to_string(&template_doc)?;
-    let mut template = String::from("# This is an automatically generated desired state template\n");
+    let yaml = serde_yaml::to_string(&template_yml)?;
+    let mut template =
+        String::from("# This is an automatically generated desired state template\n");
     for line in yaml.lines() {
         template.push_str("# ");
         template.push_str(line);
@@ -172,7 +176,7 @@ fn create_template_file(path: &Path) -> AppResult<()> {
 
     fs::write(path, template)?;
     info!(
-        "Created desired state template at '{}' with commented example",
+        "Created desired state template at '{}'",
         path.display()
     );
     Ok(())
