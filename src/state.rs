@@ -1,15 +1,12 @@
-use anyhow::{Context, Result};
+use crate::{desired_state_file, error::AppResult};
 use semver::{Version, VersionReq};
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::fs;
-use std::hash::{Hash, Hasher};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Service {
     pub name: String,
-    #[serde(rename = "version")]
     pub version_req: VersionReq,
 }
 
@@ -17,121 +14,113 @@ impl Service {
     pub fn new(name: String, version_req: VersionReq) -> Self {
         Self { name, version_req }
     }
-
-    pub fn placeholder(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            version_req: VersionReq::STAR.clone(),
-        }
-    }
 }
 
-impl PartialEq for Service {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
+#[derive(Debug, Clone)]
+pub enum StateEvent {
+    StateUpdated {
+        version: Version,
+        services: Vec<Service>,
+    },
 }
 
-impl Eq for Service {}
+pub type StateEventReceiver = Receiver<StateEvent>;
 
-impl Hash for Service {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
-    }
+#[derive(Default)]
+struct EventHub {
+    listeners: Vec<Sender<StateEvent>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct DesiredStateFile {
-    #[serde(default = "get_current_file_version")]
-    version: Version,
-    #[serde(default)]
-    services: Vec<Service>,
+impl EventHub {
+    fn subscribe(&mut self) -> StateEventReceiver {
+        let (tx, rx) = mpsc::channel();
+        self.listeners.push(tx);
+        rx
+    }
+
+    fn emit(&mut self, event: StateEvent) {
+        self.listeners
+            .retain(|sender| sender.send(event.clone()).is_ok());
+    }
 }
 
 pub struct DesiredState {
     path: PathBuf,
     file_version: Version,
-    services: HashSet<Service>,
+    services: BTreeMap<String, Service>,
+    events: EventHub,
 }
 
 impl DesiredState {
-    pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
+    pub fn load(path: impl Into<PathBuf>) -> AppResult<Self> {
         let path = path.into();
 
-        let (file_version, services) = if path.exists() {
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read desired state file {}", path.display()))?;
-            if raw.trim().is_empty() {
-                (get_current_file_version(), HashSet::new())
-            } else {
-                let parsed: DesiredStateFile = serde_yaml::from_str(&raw).with_context(|| {
-                    format!("failed to parse desired state file {}", path.display())
-                })?;
-                (parsed.version, parsed.services.into_iter().collect())
-            }
-        } else {
-            (get_current_file_version(), HashSet::new())
-        };
+        let (file_version, services) = desired_state_file::read(&path)?;
 
         let state = Self {
             path,
             file_version,
             services,
+            events: EventHub::default(),
         };
 
-        if !state.path.exists() {
-            state.persist()?;
-        }
+        desired_state_file::ensure_exists(&state.path)?;
 
         Ok(state)
     }
 
+    pub fn subscribe(&mut self) -> StateEventReceiver {
+        self.events.subscribe()
+    }
+
+    pub fn reload_from_disk(&mut self) -> AppResult<()> {
+        let (file_version, services) = desired_state_file::read(&self.path)?;
+        let changed = file_version != self.file_version || services != self.services;
+        if changed {
+            self.file_version = file_version;
+            self.services = services;
+            self.notify_listeners();
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub fn list(&self) -> Vec<&Service> {
-        let mut services: Vec<_> = self.services.iter().collect();
-        services.sort_by(|a, b| a.name.cmp(&b.name));
-        services
+        self.services.values().collect()
     }
 
-    pub fn set_service(&mut self, name: String, version_req: VersionReq) -> Result<()> {
-        let new_service = Service::new(name, version_req);
-        self.services.replace(new_service);
-        self.persist()
+    #[allow(dead_code)]
+    pub fn set_service(&mut self, name: String, version_req: VersionReq) -> AppResult<()> {
+        let service = Service::new(name, version_req);
+        self.services.insert(service.name.clone(), service);
+        desired_state_file::write(&self.path, &self.file_version, &self.services)?;
+        self.notify_listeners();
+        Ok(())
     }
 
-    pub fn remove_service(&mut self, name: &str) -> Result<bool> {
-        let placeholder = Service::placeholder(name);
-        let existed = self.services.take(&placeholder).is_some();
+    #[allow(dead_code)]
+    pub fn remove_service(&mut self, name: &str) -> AppResult<bool> {
+        let existed = self.services.remove(name).is_some();
         if existed {
-            self.persist()?;
+            desired_state_file::write(&self.path, &self.file_version, &self.services)?;
+            self.notify_listeners();
         }
         Ok(existed)
     }
 
-    fn persist(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
-        }
-
-        let mut services: Vec<_> = self.services.iter().cloned().collect();
-        services.sort_by(|a, b| a.name.cmp(&b.name));
-
-        let yaml = serde_yaml::to_string(&DesiredStateFile {
-            version: self.file_version.clone(),
-            services,
-        })
-        .with_context(|| {
-            format!(
-                "failed to serialize desired state to YAML for {}",
-                self.path.display()
-            )
-        })?;
-
-        fs::write(&self.path, yaml)
-            .with_context(|| format!("failed to write desired state file {}", self.path.display()))
+    pub fn emit_current_state(&mut self) {
+        self.notify_listeners();
     }
-}
 
-fn get_current_file_version() -> Version {
-    Version::new(0,1,0)
+    fn notify_listeners(&mut self) {
+        let event = StateEvent::StateUpdated {
+            version: self.file_version.clone(),
+            services: self.snapshot_services(),
+        };
+        self.events.emit(event);
+    }
+
+    fn snapshot_services(&self) -> Vec<Service> {
+        self.services.values().cloned().collect()
+    }
 }

@@ -1,8 +1,5 @@
-version: 1.0.0
-services:
-- name: bla
-  version: ^1.0.3
-- name: dudel
-  version: ~1.2
-- name: hudel
-  version: ^1.0.1
+# Desired state file generated automatically
+# version: 0.1.0
+# services:
+# - name: example-service
+#   version: ^1.2.3

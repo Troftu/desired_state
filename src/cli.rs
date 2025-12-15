@@ -1,51 +1,85 @@
-use crate::state::DesiredState;
-use anyhow::{Context, Result, anyhow};
-use semver::VersionReq;
+use crate::{
+    error::AppResult,
+    state::{DesiredState, StateEvent},
+};
+use log::{debug, info, warn};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::io::{self, ErrorKind};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
+use std::time::Duration;
 
-pub fn run() -> Result<()> {
-    let (state_path, args) = parse_args(env::args().skip(1).collect())?;
-    let mut state = DesiredState::load(state_path)?;
+const EVENT_LOOP_TICK: Duration = Duration::from_secs(1);
 
-    match args.first().map(String::as_str) {
-        Some("list") if args.len() == 1 => list_services(&state),
-        Some("set") if args.len() == 3 => {
-            let name = &args[1];
-            let version_req = VersionReq::parse(&args[2]).with_context(|| {
-                format!("invalid version requirement string for service {name}")
-            })?;
-            state.set_service(name.to_owned(), version_req.clone())?;
-            println!("set {} to {}", name, version_req);
-        }
-        Some("remove") if args.len() == 2 => {
-            let name = &args[1];
-            if state.remove_service(name)? {
-                println!("removed {name}");
-            } else {
-                println!("{name} was not present");
+pub fn run() -> AppResult<()> {
+    let state_path = parse_args(env::args().skip(1).collect())?;
+    let mut state = DesiredState::load(state_path.clone())?;
+    let state_events = state.subscribe();
+    let watch_target = canonicalize_for_watch(&state_path);
+
+    let (watch_tx, watch_rx) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = watch_tx.send(res);
+    })?;
+
+    watcher
+        .watch(&watch_target, RecursiveMode::NonRecursive)
+        .map_err(|err| {
+            io::Error::new(
+                ErrorKind::Other,
+                format!("failed to watch {}: {err}", watch_target.display()),
+            )
+        })?;
+
+    info!(
+        "Desired state watcher running. Monitoring '{}'",
+        watch_target.display()
+    );
+    println!("Desired state watcher running. Press Ctrl+C to stop.");
+
+    state.emit_current_state();
+    drain_state_events(&state_events);
+
+    loop {
+        drain_state_events(&state_events);
+
+        match watch_rx.recv_timeout(EVENT_LOOP_TICK) {
+            Ok(Ok(event)) => {
+                debug!(
+                    "Filesystem event '{}' for '{}'",
+                    format!("{:?}", event.kind),
+                    format!("{:?}", event.paths)
+                );
+                if event_affects_target(&event, &watch_target) && is_state_change(&event.kind) {
+                    if let Err(err) = state.reload_from_disk() {
+                        warn!("Failed to reload desired state: '{}'", err);
+                    } else {
+                        info!("Reloaded desired state after file change");
+                        drain_state_events(&state_events);
+                    }
+                }
             }
-        }
-        _ => {
-            print_usage();
-            if args.is_empty() {
-                anyhow::bail!("no command provided");
-            } else {
-                anyhow::bail!("unknown arguments: {}", args.join(" "));
+            Ok(Err(err)) => {
+                warn!("File watch error: '{}'", err);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // no-op, loop again to keep draining events
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                warn!("File watcher disconnected unexpectedly");
+                return Err(io::Error::new(
+                    ErrorKind::Other,
+                    "file watcher disconnected unexpectedly",
+                )
+                .into());
             }
         }
     }
-
-    Ok(())
 }
 
-fn list_services(state: &DesiredState) {
-    for service in state.list() {
-        println!("{} {}", service.name, service.version_req);
-    }
-}
-
-fn parse_args(args: Vec<String>) -> Result<(PathBuf, Vec<String>)> {
+fn parse_args(args: Vec<String>) -> AppResult<PathBuf> {
     let mut desired_file =
         env::var("DESIRED_STATE_FILE").unwrap_or_else(|_| "desired_state.yml".to_string());
 
@@ -55,22 +89,69 @@ fn parse_args(args: Vec<String>) -> Result<(PathBuf, Vec<String>)> {
             "--file" => {
                 let value = args
                     .get(idx + 1)
-                    .ok_or_else(|| anyhow!("--file requires a path"))?;
+                    .ok_or_else(|| invalid_argument("--file requires a path"))?;
                 desired_file = value.clone();
                 idx += 2;
             }
-            _ => break,
+            other => {
+                return Err(invalid_argument(format!("unknown argument: {other}")).into());
+            }
         }
     }
 
-    Ok((PathBuf::from(desired_file), args[idx..].to_vec()))
+    Ok(PathBuf::from(desired_file))
 }
 
-fn print_usage() {
-    eprintln!("Usage:");
-    eprintln!("  desired_state [--file path] list");
-    eprintln!("  desired_state [--file path] set <service> <version-req>");
-    eprintln!("  desired_state [--file path] remove <service>");
-    eprintln!();
-    eprintln!("File defaults to desired_state.yml or $DESIRED_STATE_FILE if set.");
+fn canonicalize_for_watch(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn event_affects_target(event: &Event, target: &Path) -> bool {
+    if event.paths.is_empty() {
+        return true;
+    }
+
+    event
+        .paths
+        .iter()
+        .any(|path| canonicalize_for_watch(path) == target)
+}
+
+fn is_state_change(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) | EventKind::Any
+    )
+}
+
+fn drain_state_events(receiver: &mpsc::Receiver<StateEvent>) {
+    loop {
+        match receiver.try_recv() {
+            Ok(event) => log_state_event(&event),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                warn!("State event channel disconnected; stopping log loop.");
+                break;
+            }
+        }
+    }
+}
+
+fn invalid_argument(msg: impl Into<String>) -> io::Error {
+    io::Error::new(ErrorKind::InvalidInput, msg.into())
+}
+
+fn log_state_event(event: &StateEvent) {
+    match event {
+        StateEvent::StateUpdated { version, services } => {
+            println!(
+                "[state-event] file version {} with {} service(s)",
+                version,
+                services.len()
+            );
+            for svc in services {
+                println!("    - {} {}", svc.name, svc.version_req);
+            }
+        }
+    }
 }
