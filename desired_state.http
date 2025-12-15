@@ -1,0 +1,20 @@
+# Base configuration for httpyac / VS Code REST Client
+@host = http://localhost:8000
+@serviceName = example-service
+
+### List all services
+GET {{host}}/services
+Accept: application/json
+
+### Upsert (create/update) a service
+PUT {{host}}/services/{{serviceName}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": "^1.2.3"
+}
+
+### Delete a service
+DELETE {{host}}/services/{{serviceName}}
+Accept: application/json

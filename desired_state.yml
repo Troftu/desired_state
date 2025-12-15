@@ -1,5 +1,4 @@
-# Desired state file generated automatically
-# version: 0.1.0
-# services:
-# - name: example-service
-#   version: ^1.2.3
+version: 0.1.0
+services:
+- name: example-service
+  version: ^1.2.3

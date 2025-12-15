@@ -140,7 +140,7 @@ pub fn ensure_exists(path: &Path) -> AppResult<()> {
     create_template_file(path)
 }
 
-pub fn current_file_version() -> Version {
+fn current_file_version() -> Version {
     Version::new(0, 1, 0)
 }
 
@@ -175,9 +175,6 @@ fn create_template_file(path: &Path) -> AppResult<()> {
     }
 
     fs::write(path, template)?;
-    info!(
-        "Created desired state template at '{}'",
-        path.display()
-    );
+    info!("Created desired state template at '{}'", path.display());
     Ok(())
 }

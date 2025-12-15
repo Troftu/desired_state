@@ -2,6 +2,7 @@ use crate::{desired_state_file, error::AppResult};
 use semver::{Version, VersionReq};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,19 +29,22 @@ pub type StateEventReceiver = Receiver<StateEvent>;
 
 #[derive(Default)]
 struct EventHub {
-    listeners: Vec<Sender<StateEvent>>,
+    listeners: Mutex<Vec<Sender<StateEvent>>>,
 }
 
 impl EventHub {
-    fn subscribe(&mut self) -> StateEventReceiver {
+    fn subscribe(&self) -> StateEventReceiver {
         let (tx, rx) = mpsc::channel();
-        self.listeners.push(tx);
+        if let Ok(mut listeners) = self.listeners.lock() {
+            listeners.push(tx);
+        }
         rx
     }
 
-    fn emit(&mut self, event: StateEvent) {
-        self.listeners
-            .retain(|sender| sender.send(event.clone()).is_ok());
+    fn emit(&self, event: StateEvent) {
+        if let Ok(mut listeners) = self.listeners.lock() {
+            listeners.retain(|sender| sender.send(event.clone()).is_ok());
+        }
     }
 }
 
@@ -69,7 +73,7 @@ impl DesiredState {
         Ok(state)
     }
 
-    pub fn subscribe(&mut self) -> StateEventReceiver {
+    pub fn subscribe(&self) -> StateEventReceiver {
         self.events.subscribe()
     }
 
@@ -84,12 +88,10 @@ impl DesiredState {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn list(&self) -> Vec<&Service> {
-        self.services.values().collect()
+    pub fn list(&self) -> Vec<Service> {
+        self.services.values().cloned().collect()
     }
 
-    #[allow(dead_code)]
     pub fn set_service(&mut self, name: String, version_req: VersionReq) -> AppResult<()> {
         let service = Service::new(name, version_req);
         self.services.insert(service.name.clone(), service);
@@ -98,7 +100,6 @@ impl DesiredState {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn remove_service(&mut self, name: &str) -> AppResult<bool> {
         let existed = self.services.remove(name).is_some();
         if existed {
@@ -110,6 +111,10 @@ impl DesiredState {
 
     pub fn emit_current_state(&mut self) {
         self.notify_listeners();
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.path.clone()
     }
 
     fn notify_listeners(&mut self) {
@@ -124,3 +129,5 @@ impl DesiredState {
         self.services.values().cloned().collect()
     }
 }
+
+pub type SharedState = std::sync::Arc<std::sync::Mutex<DesiredState>>;
